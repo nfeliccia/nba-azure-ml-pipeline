@@ -1,16 +1,45 @@
-﻿[project]
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "nba_pipeline"
 version = "0.1.0"
 description = "NBA -> Azure SQL -> Azure ML pipeline"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
+
 dependencies = [
-  "nba_api",
   "pandas",
   "numpy",
+  "nba_api",
+  "requests",
+  "tenacity",
   "pyodbc",
   "sqlalchemy",
   "python-dotenv"
 ]
+
+[project.optional-dependencies]
+azure = [
+  "azure-ai-ml",
+  "azure-identity",
+  "azure-keyvault-secrets",
+  "azureml-mlflow",
+  "mlflow"
+]
+
+dev = [
+  "pytest",
+  "ruff",
+  "black",
+  "ipykernel"
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
