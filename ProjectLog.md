@@ -1,4 +1,183 @@
-﻿
+﻿## 2025-12-15 (Late Evening) — Option B completed end-to-end; NBA API blocked from Azure VM; plan hybrid ingest tomorrow
+
+**Objective**
+- Complete the “showcase-grade” Option B architecture:
+  - Azure SQL stays private-only (no public exposure)
+  - VNet + subnets + Private Endpoint + Private DNS provide private data plane access
+  - A private Linux VM (no public IP) accessed via Bastion runs schema + database operations
+  - Authentication uses Entra ID and Managed Identity (no stored passwords)
+- Attempt first live NBA API pull from inside Azure to validate end-to-end ingest feasibility.
+
+---
+
+## What I completed
+
+### 1) Network foundation deployed (VNet + subnets)
+- Deployed `vnet-nba-ml` in `eastus2` with address space `10.40.0.0/16`.
+- Subnets established for:
+  - Private endpoints (`10.40.1.0/24`)
+  - Compute (`10.40.2.0/24`)
+  - Bastion (`10.40.3.0/26`, named `AzureBastionSubnet`)
+- Deployment succeeded and outputs confirmed the VNet resource ID.
+
+### 2) Private Link + Private DNS wired for Azure SQL
+- Deployed:
+  - Private DNS Zone: `privatelink.database.windows.net`
+  - VNet link to `vnet-nba-ml`
+  - Private Endpoint: `pe-sql` targeting Azure SQL server
+  - Private DNS zone group for automatic DNS mapping
+- Deployment succeeded. This establishes “SQL is reachable privately from inside the VNet” without enabling public access.
+
+### 3) Bastion + private Linux VM deployed (no public IP on VM)
+- Generated a dedicated SSH key for the VM and successfully deployed:
+  - Bastion host (`bas-nba`) with a public IP (Bastion requires it)
+  - Linux VM `vm-nba-runner` in compute subnet with private IP `10.40.2.4`
+  - NIC + NSG
+- Verified the VM is private-only and accessible through Bastion. This is a strong security posture.
+
+### 4) VM tooling and dependency troubleshooting (ODBC + Python)
+To execute SQL from the VM using AAD tokens, I solved several layered issues:
+- Installed Python venv tooling and pip, aligned `pyproject.toml` to allow Python 3.10 on Ubuntu.
+- Installed unixODBC runtime (`libodbc2`, `unixodbc`) so `pyodbc` could import.
+- Installed Microsoft ODBC Driver 18 for SQL Server (`msodbcsql18`) after adding Microsoft’s Ubuntu package feed.
+- Fixed ODBC configuration discovery issues by ensuring environment variables were set:
+  - `ODBCSYSINI=/etc`
+  - `ODBCINI=/etc/odbc.ini`
+- Confirmed ODBC driver registration via `odbcinst`.
+
+### 5) Identity: Entra admin bootstrap + Managed Identity execution
+- Created a Python SQL executor (`scripts/exec_sql_with_aad.py`) that can authenticate using:
+  - Azure CLI credential (interactive Entra identity) OR
+  - VM Managed Identity (unattended)
+- Bootstrapped database permissions using CLI credential:
+  - Applied `infra/sql/000_bootstrap_vm_identity.sql`
+- Then applied schema using Managed Identity (unattended):
+  - Created `dbo.fact_team_game_log` with primary key `(team_id, game_id)`
+  - Verified ability to execute additional SQL scripts over Private Link using `--cred mi`
+- This proves the “no-secrets automation” pattern is working: the VM can run SQL changes without passwords.
+
+### 6) Source control improvements on the VM
+- Fixed GitHub push authentication by switching the VM to SSH-based Git operations:
+  - Generated SSH key, added to GitHub, updated remote URL
+  - Successfully pushed commits from inside the private VM
+
+---
+
+## Attempted NBA API pull from Azure VM (blocked)
+- Tried running `nba_api` call (`TeamGameLog`) from the private Azure VM.
+- The request to `stats.nba.com` timed out (read timeout), consistent with the known issue that NBA endpoints block or degrade access from cloud IP ranges.
+- Conclusion: The Azure VM is ideal for **private SQL work**, but not reliable for **NBA data acquisition** directly from Azure.
+
+---
+
+## End-of-day state
+- Azure SQL is private-only and operational.
+- Private networking, private endpoint, private DNS, and VM+Bastion are all working.
+- Managed Identity SQL execution is working.
+- NBA data was successfully downloaded from a non-Azure machine (local), but not from the Azure VM.
+- VM was stopped/deallocated (“snoozing”) to control costs.
+
+---
+
+## Plan for tomorrow (new direction)
+Goal: bypass the NBA cloud-IP blockage while keeping Azure SQL private.
+
+Proposed approach:
+- Use **Azure Arc** to onboard a non-Azure machine (home PC) into the “Azure universe” as a managed resource.
+- Run NBA API extraction from the home PC using its residential ISP egress (not blocked).
+- Transfer raw files to Azure (likely Blob Storage), then run the private Azure VM loader to insert into Azure SQL via private endpoint.
+- Build a clean wrapper/interface so “ingest” and “load to SQL” are decoupled and repeatable.
+
+---
+
+## Notes (human)
+- A scheduling mix-up (dentist appointment confusion) created some friction late in the day.
+- Even with that, today’s progress was substantial (roughly a full workday of cloud engineering + troubleshooting), and the core Option B showcase architecture is now real and reproducible.
+
+
+
+## 2025-12-15 (Evening) — Bootstrapped Azure SQL permissions via Entra ID token (CLI cred) from private VM
+
+**Objective**
+- Run database schema/permission changes against Azure SQL while keeping:
+  - `publicNetworkAccess = Disabled`
+  - Azure AD-only authentication enabled
+- Prove “inside the VNet” access works end-to-end:
+  - Private DNS + Private Endpoint routing
+  - ODBC connectivity
+  - AAD token-based authentication
+- Set up the permissions needed so the VM can later run SQL scripts unattended using its Managed Identity.
+
+---
+
+## What I did
+
+### 1) Confirmed the private network path
+- Verified the VM could reach Azure SQL on port 1433 through the private endpoint.
+- This validated the networking buildout (VNet, private endpoint, private DNS) was correct before touching auth.
+
+### 2) Installed and configured Linux ODBC dependencies
+I hit several layered dependency issues and resolved them in order:
+
+- `pyodbc` import initially failed due to missing unixODBC runtime (`libodbc.so.2`)
+  - Installed `unixodbc` / `libodbc2` to provide the driver manager libraries.
+- Next error: ODBC Driver 18 for SQL Server not found
+  - Installed Microsoft’s SQL ODBC driver `msodbcsql18`.
+- `odbcinst` initially errored (`SQLGetPrivateProfileString failed`)
+  - Fixed by ensuring the environment variables pointed to standard config locations:
+    - `ODBCSYSINI=/etc`
+    - `ODBCINI=/etc/odbc.ini`
+  - Verified with `odbcinst -j` and `odbcinst -q -d`.
+
+**Result:** The VM can use `pyodbc` with “ODBC Driver 18 for SQL Server” successfully.
+
+### 3) Fixed GitHub auth on the VM (SSH)
+- Attempted `git push` over HTTPS and it failed (GitHub password auth disabled).
+- Generated an SSH keypair on the VM, added the public key to GitHub, and updated repo remote URL to SSH.
+- Verified with `ssh -T git@github.com`, then pushed successfully.
+- This is important because it allows clean source-control workflows directly from private compute.
+
+### 4) Executed bootstrap SQL using Entra ID token via Azure CLI credential
+- First attempt to run SQL via `DefaultAzureCredential()` failed with:
+  - `Login failed for user '<token-identified principal>'`
+- Root cause:
+  - On an Azure VM, `DefaultAzureCredential()` will commonly use the VM’s **Managed Identity** automatically.
+  - The VM’s Managed Identity did not yet exist as a database user, so SQL rejected it.
+- Fix:
+  - Updated `scripts/exec_sql_with_aad.py` to support explicit credential selection:
+    - `--cred cli` uses **AzureCliCredential** (interactive Entra login)
+    - `--cred mi` uses **ManagedIdentityCredential** (unattended)
+- Ran the bootstrap step using my Entra admin session:
+  - `python scripts/exec_sql_with_aad.py --sql infra/sql/000_bootstrap_vm_identity.sql --cred cli`
+- Result:
+  - `Applied: infra/sql/000_bootstrap_vm_identity.sql (cred=cli)`
+
+**What that bootstrap script does**
+- Creates a database user for the VM identity from Entra ID (“FROM EXTERNAL PROVIDER”)
+- Grants least-privilege roles needed for this project:
+  - `db_ddladmin`, `db_datareader`, `db_datawriter`
+
+This is the “bridge” step that enables future automation without storing secrets.
+
+---
+
+## Why this matters
+- This proves a full enterprise-grade pattern:
+  - Azure SQL is private-only (no public internet)
+  - Authentication is Entra ID token-based (AAD-only)
+  - Operational automation can be done with Managed Identity (no passwords in code, no secrets in git)
+- It’s a key milestone for the showcase project because it demonstrates:
+  - Networking (VNet + Private Link + Private DNS)
+  - Identity and access control (Entra ID admin + managed identity)
+  - Real troubleshooting across OS deps (ODBC driver manager, MS ODBC Driver 18, odbcinst config)
+
+---
+
+## Next step
+1) Run the first real schema script using **Managed Identity** (unattended):
+   - `python scripts/exec_sql_with_aad.py --sql infra/sql/001_create_fact_team_game_log.sql --cred mi`
+2) Confirm table exists in Azure SQL and begin loading TeamGameLog data into it.
+
 ## 2025-12-15 (PM) — Provisioned Azure SQL via Bicep using Azure CLI from Windows PowerShell (IaC + security-first)
 
 **Objective**

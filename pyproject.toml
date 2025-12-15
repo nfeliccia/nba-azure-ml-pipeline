@@ -9,30 +9,30 @@ description = "NBA -> Azure SQL -> Azure ML pipeline"
 requires-python = ">=3.10"
 
 dependencies = [
-  "pandas",
-  "numpy",
-  "nba_api",
-  "requests",
-  "tenacity",
-  "pyodbc",
-  "sqlalchemy",
-  "python-dotenv"
+    "pandas",
+    "numpy",
+    "nba_api",
+    "requests",
+    "tenacity",
+    "pyodbc",
+    "sqlalchemy",
+    "python-dotenv",
+    "azure-identity"
 ]
 
 [project.optional-dependencies]
 azure = [
-  "azure-ai-ml",
-  "azure-identity",
-  "azure-keyvault-secrets",
-  "azureml-mlflow",
-  "mlflow"
+    "azure-ai-ml",
+    "azure-keyvault-secrets",
+    "azureml-mlflow",
+    "mlflow"
 ]
 
 dev = [
-  "pytest",
-  "ruff",
-  "black",
-  "ipykernel"
+    "pytest",
+    "ruff",
+    "black",
+    "ipykernel"
 ]
 
 [tool.setuptools.package-dir]
