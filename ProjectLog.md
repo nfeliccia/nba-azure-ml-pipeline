@@ -1,4 +1,141 @@
-﻿ ### 2025-12-15 (AM) — Repo bootstrapped, dev branch created, first NBA API pull succeeded
+﻿
+## 2025-12-15 (PM) — Provisioned Azure SQL via Bicep using Azure CLI from Windows PowerShell (IaC + security-first)
+
+**Objective**
+- Create a real Azure SQL Server + Azure SQL Database using Infrastructure-as-Code (IaC) so the NBA pipeline has a cloud “system of record”.
+- Do it in a way that demonstrates Azure competency for AZ-900 and portfolio purposes:
+  - Use Azure CLI
+  - Use Bicep (and generate ARM JSON)
+  - Follow secure defaults (no public exposure by default)
+  - Capture the work in the repo so it’s reproducible.
+
+---
+
+## What I did (high-level narrative)
+
+### 1) Worked locally in Windows PowerShell, not Cloud Shell
+- I ran everything from my **Windows workstation** using **Windows PowerShell** as the shell.
+- I invoked **Azure CLI** commands (`az ...`) from PowerShell.
+- I did **not** use Bash.
+- I did **not** use Azure Cloud Shell.
+- This matters because it proves I can run Azure provisioning workflows from a “normal” engineering workstation, which is the reality for many enterprise environments.
+
+### 2) Used Azure CLI authentication + subscription context management
+- I authenticated with `az login`.
+- Initially I hit an identity/subscription mismatch (multiple identities/tenants). I resolved this by selecting the correct tenant/subscription where my resource group exists.
+- I confirmed the active subscription context with:
+  - `az account list -o table`
+- I validated the subscription was enabled and set as default.
+
+**Outcome**
+- Azure CLI was correctly pointed at:
+  - Subscription: `MightyWorkSubscription`
+  - Subscription ID: `659bc9fe-df16-4de2-902f-cf9883772bc7`
+  - Tenant: `cce0306d-cc27-4c78-80a1-00e10ecc1da3`
+
+### 3) Captured parameters in PowerShell variables (portable and repeatable)
+- In PowerShell I set variables like:
+  - `$rg` (resource group name)
+  - `$sqlServerName` (globally-unique SQL server name)
+  - `$sqlAdminLogin`
+  - `$aadLogin` and `$aadObjectId` (for Entra admin assignment)
+- These values were then passed into the deployment command.
+- This is important: the parameterization keeps the deployment reproducible and avoids hardcoding values inside the template.
+
+### 4) Implemented Infrastructure-as-Code using Bicep
+- I created a Bicep template in the repo:
+  - `infra/bicep/sql.bicep`
+- This template provisions:
+  - Azure SQL logical server (`Microsoft.Sql/servers`)
+  - Azure SQL database (`Microsoft.Sql/servers/databases`)
+  - Entra ID (Azure AD) administrator (`Microsoft.Sql/servers/administrators`)
+  - Azure AD-only authentication (`Microsoft.Sql/servers/azureADOnlyAuthentications`)
+  - (Optional) firewall rules (present but disabled by default)
+- I ran `az deployment group validate` to validate before creation.
+- Then I ran `az deployment group create` to deploy it at **resource-group scope**.
+
+### 5) Security-first defaults were enforced
+The deployed SQL Server configuration confirms several “good security posture” decisions:
+- **Public network access disabled**:
+  - `publicNetworkAccess: Disabled`
+- **Minimum TLS version = 1.2**
+- **Azure AD-only authentication enabled**
+- SQL admin password was **not committed** and not stored in files:
+  - I prompted for it securely in PowerShell (`Read-Host -AsSecureString`)
+  - Converted it only for the duration of the command
+  - Then removed the plaintext variable
+
+**Why this matters**
+- This is the exact kind of control AZ-900 expects you to understand: identity, network exposure, encryption-in-transit, and secure secrets handling.
+
+### 6) Fixed a real-world deployment sequencing issue (important learning)
+- My first attempt failed with a clear ARM error stating that Azure AD-only auth cannot be enabled until the Azure AD admin is configured.
+- I corrected the Bicep template by explicitly sequencing the resources (ensuring AAD admin is created before enabling AAD-only auth).
+- The final deployment succeeded.
+
+This was a real “cloud engineering” moment:
+- Validation can pass while deployment fails due to ordering constraints.
+- Knowing how to read ARM errors and adjust IaC is a key practical skill.
+
+### 7) Generated ARM JSON from Bicep (explicit “Bicep → ARM” proof)
+- After deploying successfully, I generated the equivalent ARM JSON:
+  - `az bicep build --file .\infra\bicep\sql.bicep --outfile .\infra\arm\sql.json`
+- This is important for learning/portfolio:
+  - It demonstrates that Bicep is a higher-level DSL that compiles to ARM templates.
+  - I now have both artifacts in source control.
+
+### 8) Verified success with CLI evidence (trust but verify)
+I verified end-to-end success with:
+- Deployment state:
+  - `az deployment group show ... --query properties.provisioningState`
+  - Result: `Succeeded`
+- SQL Server existence and key properties:
+  - `az sql server show ...`
+  - Confirmed: server is `Ready`, public access disabled, TLS 1.2, AAD-only auth enabled, FQDN assigned
+- Database existence and status:
+  - `az sql db show ...`
+  - Confirmed: database `nba` is `Online`
+
+---
+
+## Deliverables produced (in repo + Azure)
+
+### In Azure
+- Resource group (already existed): `rg_nba_prediction_26` in `eastus2`
+- SQL Server: `nba-sql-189800`
+- Database: `nba`
+- Entra admin configured and Azure AD-only authentication enabled
+
+### In GitHub repo
+- `infra/bicep/sql.bicep` — source IaC template
+- `infra/arm/sql.json` — transpiled ARM template artifact
+- Git commit pushed via PyCharm
+
+---
+
+## Why this matters for the larger project
+This milestone is not “just admin work.”
+It establishes the durable cloud foundation for the pipeline:
+- All NBA raw/base data will ultimately land here (Azure SQL as the system of record).
+- Azure ML feature engineering and training will later read from this database (or from curated exports).
+- This is also strong portfolio evidence that I can:
+  - Use IaC
+  - Use Azure CLI
+  - Work with identity + tenants + subscriptions
+  - Apply secure defaults (no public exposure by default)
+  - Troubleshoot real ARM deployment issues
+
+---
+
+## Next step
+- Decide how to connect to the DB for schema creation, given public access is disabled:
+  - Option A: temporarily enable public access restricted to my IP (dev convenience, documented as temporary)
+  - Option B: private endpoint + private DNS (enterprise-grade; more setup)
+- Apply the first schema script to create the initial table for `TeamGameLog` ingestion.
+
+
+
+### 2025-12-15 (AM) — Repo bootstrapped, dev branch created, first NBA API pull succeeded
 
 **Objective**
 - Start fresh on the NBA-to-Azure project with a clean, portfolio-quality Git repo.
