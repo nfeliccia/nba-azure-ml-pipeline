@@ -1,0 +1,16 @@
+﻿[project]
+name = "nba_pipeline"
+version = "0.1.0"
+description = "NBA -> Azure SQL -> Azure ML pipeline"
+requires-python = ">=3.13"
+dependencies = [
+  "nba_api",
+  "pandas",
+  "numpy",
+  "pyodbc",
+  "sqlalchemy",
+  "python-dotenv"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
