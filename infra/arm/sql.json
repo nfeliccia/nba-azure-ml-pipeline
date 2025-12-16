@@ -1,0 +1,178 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.39.26.7824",
+      "templateHash": "17702005623952492092"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for resources."
+      }
+    },
+    "sqlServerName": {
+      "type": "string",
+      "metadata": {
+        "description": "Logical SQL Server name (must be globally unique)."
+      }
+    },
+    "sqlDatabaseName": {
+      "type": "string",
+      "defaultValue": "nba",
+      "metadata": {
+        "description": "Database name."
+      }
+    },
+    "sqlAdminLogin": {
+      "type": "string",
+      "metadata": {
+        "description": "SQL admin login (required by SQL logical server creation)."
+      }
+    },
+    "sqlAdminPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "SQL admin password (do not store in git; pass at deploy time)."
+      }
+    },
+    "aadAdminLogin": {
+      "type": "string",
+      "metadata": {
+        "description": "Entra ID (Azure AD) admin display name (user or group)."
+      }
+    },
+    "aadAdminObjectId": {
+      "type": "string",
+      "metadata": {
+        "description": "Entra ID objectId (GUID) of the admin user/group."
+      }
+    },
+    "enablePublicNetworkAccess": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Default: DISABLE public access. Set true temporarily for dev/testing."
+      }
+    },
+    "allowedIp": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "If public access is enabled, optionally restrict to a single IPv4 address (your current IP)."
+      }
+    },
+    "allowAzureServices": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Optional: allow Azure services to access this SQL server (implements the portal checkbox)."
+      }
+    },
+    "skuName": {
+      "type": "string",
+      "defaultValue": "GP_S_Gen5_1",
+      "metadata": {
+        "description": "Database SKU name, e.g., GP_S_Gen5_1."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Sql/servers",
+      "apiVersion": "2024-11-01-preview",
+      "name": "[parameters('sqlServerName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "version": "12.0",
+        "administratorLogin": "[parameters('sqlAdminLogin')]",
+        "administratorLoginPassword": "[parameters('sqlAdminPassword')]",
+        "minimalTlsVersion": "1.2",
+        "publicNetworkAccess": "[if(parameters('enablePublicNetworkAccess'), 'Enabled', 'Disabled')]",
+        "restrictOutboundNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/administrators",
+      "apiVersion": "2024-11-01-preview",
+      "name": "[format('{0}/{1}', parameters('sqlServerName'), 'ActiveDirectory')]",
+      "properties": {
+        "administratorType": "ActiveDirectory",
+        "login": "[parameters('aadAdminLogin')]",
+        "sid": "[parameters('aadAdminObjectId')]",
+        "tenantId": "[tenant().tenantId]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Sql/servers/azureADOnlyAuthentications",
+      "apiVersion": "2024-11-01-preview",
+      "name": "[format('{0}/{1}', parameters('sqlServerName'), 'Default')]",
+      "properties": {
+        "azureADOnlyAuthentication": true
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers/administrators', parameters('sqlServerName'), 'ActiveDirectory')]",
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Sql/servers/databases",
+      "apiVersion": "2024-11-01-preview",
+      "name": "[format('{0}/{1}', parameters('sqlServerName'), parameters('sqlDatabaseName'))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "[parameters('skuName')]"
+      },
+      "properties": {
+        "collation": "SQL_Latin1_General_CP1_CI_AS"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]"
+      ]
+    },
+    {
+      "condition": "[and(parameters('enablePublicNetworkAccess'), not(equals(parameters('allowedIp'), '')))]",
+      "type": "Microsoft.Sql/servers/firewallRules",
+      "apiVersion": "2024-11-01-preview",
+      "name": "[format('{0}/{1}', parameters('sqlServerName'), 'AllowMyIp')]",
+      "properties": {
+        "startIpAddress": "[parameters('allowedIp')]",
+        "endIpAddress": "[parameters('allowedIp')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]"
+      ]
+    },
+    {
+      "condition": "[and(parameters('enablePublicNetworkAccess'), parameters('allowAzureServices'))]",
+      "type": "Microsoft.Sql/servers/firewallRules",
+      "apiVersion": "2024-11-01-preview",
+      "name": "[format('{0}/{1}', parameters('sqlServerName'), 'AllowAzureServices')]",
+      "properties": {
+        "startIpAddress": "0.0.0.0",
+        "endIpAddress": "0.0.0.0"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "sqlServerFqdn": {
+      "type": "string",
+      "value": "[format('{0}.{1}', parameters('sqlServerName'), environment().suffixes.sqlServerHostname)]"
+    },
+    "databaseName": {
+      "type": "string",
+      "value": "[parameters('sqlDatabaseName')]"
+    }
+  }
+}
