@@ -1,4 +1,113 @@
-﻿## 2025-12-18 — Local Extract → Blob Handoff (Run Extract CLI + Config)
+﻿
+````markdown
+## 2025-12-18 — First successful “Home PC → Blob” raw ingestion (TeamGameLog)
+
+### Where we left off (pipeline architecture)
+We are intentionally using a two-tier design due to the NBA API blocking Microsoft Azure–associated IP ranges:
+
+- **Home PC (public internet egress):** call NBA API and upload **raw JSON** to Azure Blob.
+- **Azure cloud side (private VM + Azure SQL):** download raw JSON and upsert into private Azure SQL using identity-based access.
+- Azure-hosted compute will **not** call the NBA API directly.
+
+Blob storage acts as the clean handoff boundary between public egress and the private Azure data plane.
+
+---
+
+### What was implemented
+Codex-generated (and then lightly corrected) a new extractor/uploader workflow:
+
+1) **Config-driven CLI**
+- Config file: `config/extract.yaml`
+- CLI entrypoint:
+  ```bash
+  python -m nba_pipeline.ingest.run_extract --config config/extract.yaml
+````
+
+* Config supports:
+
+  * `teams` as a list
+  * `seasons` as a list
+  * output prefix and filename template
+
+2. **SP-based Blob upload (no AzCopy, no PowerShell uploads)**
+
+* `.env` in repo root contains:
+
+  * `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`
+  * `AZURE_STORAGE_ACCOUNT=stnba86412597`
+  * `AZURE_STORAGE_CONTAINER=nba-raw`
+* Uploads use `azure-identity` + `azure-storage-blob` via a reusable `BlobUploader` helper.
+* We explicitly avoided requiring `AZURE_STORAGE_CONNECTION_STRING` to keep the auth model consistent and sustainable.
+
+3. **Run-scoped blob naming convention**
+   Each run generates a UTC `run_id` and uploads to:
+
+`runs/<run_id>/raw/nba_api/teamgamelog/<filename>.json`
+
+This gives:
+
+* clear lineage and auditability
+* straightforward reprocessing by run_id
+* easy filtering for event triggers
+
+---
+
+### Issue encountered and resolution (RBAC + resource move)
+
+We hit a 403 error:
+
+`AuthorizationPermissionMismatch` during a container preflight operation.
+
+Root cause:
+
+* The storage account was moved to a new resource group (`rg_nba_prediction_26`), and prior RBAC assignments did not exist at the new scope.
+
+Fix:
+
+* Granted the service principal the **Storage Blob Data Contributor** role at the storage account scope in the new RG.
+
+---
+
+### Successful test run (proof)
+
+Ran:
+
+```powershell
+uv run python -m nba_pipeline.ingest.run_extract --config ./config/extract.yaml
+```
+
+Output:
+
+* run_id generated: `20251218T170334Z`
+* 1 team × 1 season
+* Upload succeeded:
+
+  * blob path:
+    `runs/20251218T170334Z/raw/nba_api/teamgamelog/teamgamelog_team1610612744_season2023-24_20251218T170334Z.json`
+  * size ~13.35 KiB
+* Verified in Azure Portal by browsing the container and downloading the blob; JSON content looks correct.
+
+Note:
+
+* The depth of the blob prefix is not a technical concern; Blob “folders” are just prefixes on a single blob name string. This structure is compatible with Event Grid filtering and/or blob trigger logic for Azure Functions.
+
+---
+
+### Next planned step (new chapter)
+
+Implement an **Azure Function** (or equivalent Azure-hosted compute) that:
+
+1. triggers when a new blob is created under the TeamGameLog prefix
+2. reads the raw JSON
+3. parses into a DataFrame (or direct row objects)
+4. performs an idempotent SQL upsert (stage + MERGE) into Azure SQL
+
+We are at a good stopping point: ingestion-to-Blob is now working end-to-end.
+
+```
+```
+
+## 2025-12-18 — Local Extract → Blob Handoff (Run Extract CLI + Config)
 
 ### Context / Why we changed the approach
 We confirmed the root constraint: the NBA API blocks requests originating from Microsoft Azure–associated public IP ranges. Because of this, any design where Azure-hosted compute calls the NBA API directly is unreliable.
