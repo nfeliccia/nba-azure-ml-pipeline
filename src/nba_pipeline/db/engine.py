@@ -14,7 +14,8 @@ import os
 import struct
 from typing import Any, Callable, Dict
 
-from azure.identity import ClientSecretCredential, DefaultAzureCredential, TokenCredential
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from azure.core.credentials import TokenCredential
 from sqlalchemy import event
 from sqlalchemy.engine import Engine, URL, create_engine
 
@@ -23,7 +24,7 @@ COPT_SS_ACCESS_TOKEN = 1256
 TOKEN_SCOPE = "https://database.windows.net/.default"
 
 
-def _build_credential() -> TokenCredential:
+def _build_credential() -> ClientSecretCredential | DefaultAzureCredential:
     """Return the credential for the current environment."""
 
     client_id = os.getenv("AZURE_CLIENT_ID")
