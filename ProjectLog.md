@@ -1,5 +1,216 @@
 ﻿
-````markdown
+## 2025-12-18 — Private Azure SQL bootstrap via Bastion + Entra tokens (sqlcmd)
+
+### Context / Goal
+
+We need `vm-nba-runner` (private VM) to upsert TeamGameLog rows into a **private-only Azure SQL Database** (serverless, currently Paused) using **Entra ID auth**. Because `publicNetworkAccess` is disabled and SQL is reachable only via **private endpoint**, all SQL “data-plane” work (T-SQL) must be executed from inside the VNet.
+
+### What we did
+
+1. **Confirmed SQL Server Entra Admin identity**
+
+* Ran on home PC:
+
+  * `az sql server ad-admin list -g rg_nba_prediction_26 -s nba-sql-189800 -o table`
+* Result: Entra admin is **my user** (`nfeliccia@hotmail.com`), not the service principal. Azure AD only auth is enabled.
+
+2. **Connected to the VM using Azure Bastion**
+
+* Chrome Bastion session was unstable.
+* Switched to **Microsoft Edge** and Bastion connection succeeded.
+* Learned: Bastion browser session reliability can vary by browser/extensions; Edge behaved better for this session.
+
+3. **Installed SQL tooling on the VM (Ubuntu 22.04)**
+
+* Installed ODBC driver + sqlcmd:
+
+  * `msodbcsql18`
+  * `mssql-tools18` (sqlcmd)
+
+4. **Authenticated on VM as my Entra user + created a SQL access token file**
+
+* Logged in on the VM with:
+
+  * `az login --use-device-code`
+* Created token file for sqlcmd:
+
+  ```bash
+  az account get-access-token --resource https://database.windows.net --output tsv \
+  | cut -f 1 | tr -d '\n' | iconv -f ascii -t UTF-16LE > /tmp/sqltoken
+  ```
+* Key learning: token is requested for the **Azure SQL resource** (`https://database.windows.net`), not for my specific server hostname. Authorization still happens in the database via contained users + roles.
+
+5. **Validated private connectivity + successful sqlcmd login**
+
+* Confirmed we can connect to the private SQL endpoint from the VM:
+
+  ```bash
+  sqlcmd -S tcp:nba-sql-189800.database.windows.net,1433 -d nba -G -P /tmp/sqltoken -Q "SELECT DB_NAME() AS db;"
+  ```
+* Output showed DB = `nba`.
+
+6. **Created contained database user for VM Managed Identity + granted roles**
+
+* Ran idempotent T-SQL via sqlcmd:
+
+  * `CREATE USER [vm-nba-runner] FROM EXTERNAL PROVIDER;`
+  * Added to `db_datareader` and `db_datawriter`
+* Verified:
+
+  * `vm-nba-runner` exists as `EXTERNAL_USER` with `EXTERNAL` authentication
+  * Role memberships show:
+
+    * `db_datareader`
+    * `db_datawriter`
+    * **db_ddladmin** (unexpected; noted for later tightening if not needed)
+
+7. **Added the service principal as a contained user + granted roles**
+
+* Discovered env var issue on home PC: `$env:AZURE_CLIENT_ID` wasn’t set in that PowerShell session, so `az ad sp show --id $env:AZURE_CLIENT_ID` failed.
+* Loaded clientId and retrieved SP details:
+
+  * Service principal displayName: `sp-nba-home-uploader`
+  * AppId: `b2fc7d7c-fc7a-4bfe-90d2-2c993d216efc`
+  * ObjectId: `5467314e-a9b9-47b5-9cf5-5232cec21ac9`
+  * CreatedDateTime: `2025-12-17T16:06:59Z`
+* On VM, created user + granted roles:
+
+  * `CREATE USER [sp-nba-home-uploader] FROM EXTERNAL PROVIDER;`
+  * Added to `db_datareader` and `db_datawriter`
+* Verified memberships succeeded.
+
+### Why this matters (architecture decision captured)
+
+* **Azure SQL Database serverless doesn’t have a “start server” workflow** to orchestrate. It resumes when a client connects.
+* Since SQL is private-only, the **VM is our data-plane execution environment** and can safely:
+
+  * resume SQL via first connection (handle transient resume errors with retries in loader code)
+  * upsert using Entra auth (Managed Identity recommended for VM-side runtime)
+* Entra-backed contained users (`FROM EXTERNAL PROVIDER`) are the clean “passwordless” pattern:
+
+  * VM runtime: **System Assigned Managed Identity** (no secrets)
+  * Optional dev/admin access: **service principal** or user identity
+
+### Outputs / Current state
+
+* `vm-nba-runner` (managed identity) now has DB permissions:
+
+  * `db_datareader`, `db_datawriter` (and currently `db_ddladmin`)
+* `sp-nba-home-uploader` now has DB permissions:
+
+  * `db_datareader`, `db_datawriter`
+* Verified private connectivity from VM to SQL works via sqlcmd with Entra token.
+
+### Next steps
+
+1. Decide if `db_ddladmin` on `vm-nba-runner` is intentional; if not, remove it.
+2. Implement DB access in Python using **SQLAlchemy + pyodbc** with Entra token auth:
+
+   * Use service principal locally only if needed; prefer Managed Identity on the VM.
+3. Continue building the event-driven pipeline:
+
+   * Event Grid → Logic App(s) → start VM → VM Run Command to enqueue/run loader → watchdog deallocate after idle.
+ 
+
+## 2025-12-18 — Architecture decision: Event-driven “Blob → VM loader” (private SQL) + cost-controlled VM runtime
+
+### Problem we are solving (root cause)
+The NBA API blocks requests from Microsoft Azure–associated public IP ranges. Because of that, Azure-hosted compute cannot reliably call the NBA API directly.
+
+Additionally, our Azure SQL Server is configured as private-only:
+- `publicNetworkAccess = Disabled`
+- Private Endpoint enabled
+- Azure AD only authentication
+
+So the “load into SQL” step must occur from compute that can reach the SQL private endpoint (our private VM already satisfies this).
+
+### What we decided
+We are implementing a two-tier pipeline with an event-driven handoff:
+
+1) **Home PC (public internet egress)**
+- Calls the NBA API (nba_api TeamGameLog).
+- Uploads raw JSON into Azure Blob Storage (container `nba-raw`) under a run-scoped prefix.
+- This keeps the home machine responsibilities minimal and avoids building a complicated data lake.
+
+2) **Azure (private data plane)**
+- Azure Blob is the landing zone and event source.
+- When a new blob is created, we will use **Event Grid** to publish the event.
+- Instead of parsing JSON in T-SQL (not confident / not worth it yet), we will parse in **Python** and upsert to Azure SQL.
+- Because SQL is private-only and we want to stay simple, we will use the existing private VM (`vm-nba-runner`) to do the parsing + SQL upsert.
+
+### Why Event Grid + Logic Apps + VM (instead of Azure Functions right now)
+- Event Grid is the correct eventing service for “BlobCreated” notifications.
+- Azure Functions on classic Consumption can be complicated with private network resources; we want the simplest reliable path.
+- Logic Apps (Consumption) can act as the orchestrator to:
+  - receive Event Grid events
+  - start the VM (if stopped)
+  - call a “run loader now” endpoint/action
+  - schedule a shutdown if idle
+
+### Cost control / operational behavior
+Target behavior:
+- If the VM is stopped and a new blob arrives, start the VM.
+- Run the loader on the VM to process the newest blob (or run_id).
+- If no new files are received for ~10 minutes, shut the VM down to avoid idle cost.
+
+Implementation idea:
+- Event Grid → Logic App triggers on blob create.
+- Logic App:
+  - starts VM (if needed)
+  - triggers loader run (via SSH command, or VM Run Command, or a lightweight “loader service” listening internally)
+  - starts/restarts a 10-minute idle shutdown timer
+- VM:
+  - downloads latest run (or uses blob URL passed in)
+  - parses JSON → DataFrame
+  - upserts into `dbo.fact_team_game_log` (idempotent MERGE keyed on `(team_id, game_id)`)
+  - reports success via logs
+  - shuts down when idle timer expires
+
+### Status
+- Home PC → Blob raw JSON upload is working successfully with SP auth and run-scoped blob paths.
+- Next chapter: implement Event Grid + Logic App orchestration + VM-side loader execution + idle shutdown behavior.
+ 
+
+ 
+
+## New prompt to start a fresh chat (same project)
+
+Copy/paste this as your first message in the new conversation:
+
+```text
+I’m continuing my nba-azure-ml-pipeline project.
+
+Current state:
+- NBA API blocks Azure IPs, so extraction runs on my home PC only.
+- Home PC uploads raw JSON TeamGameLog payloads to Blob:
+  container: nba-raw
+  path pattern: runs/<run_id>/raw/nba_api/teamgamelog/*.json
+- Azure SQL is private-only:
+  publicNetworkAccess disabled, private endpoint enabled, Azure AD only
+- I have a private VM vm-nba-runner with SystemAssigned Managed Identity that can reach SQL privately.
+
+Goal:
+Build an event-driven workflow where:
+1) When a new blob arrives in nba-raw under the teamgamelog prefix, Event Grid fires.
+2) A Logic App (Consumption) handles the event:
+   - If vm-nba-runner is stopped, start it.
+   - Trigger the VM to run the loader (Python) that downloads the new blob (or latest run_id), parses JSON into rows, and upserts into dbo.fact_team_game_log using Managed Identity.
+   - Implement cost control: if no new files arrive for 10 minutes, shut down the VM.
+
+Please guide me step-by-step through the Azure setup:
+- Event Grid subscription on the storage account/container with prefix/suffix filters for teamgamelog JSON.
+- Logic App workflow design (trigger + start VM action + run command on VM + idle shutdown timer/reset behavior).
+- VM-side approach for “run loader now” (best option among: Azure VM Run Command, SSH, systemd service + queue file, or other low-debt method).
+- How to implement the 10-minute idle shutdown safely (avoid shutting down mid-run).
+Include concrete Azure Portal steps and the exact az CLI commands where helpful.
+ ```
+
+What I think: this is a solid, interview-ready architecture story and a very AZ-900-flavored pattern (eventing + orchestration + compute + private networking + cost control).
+
+
+
+
+
 ## 2025-12-18 — First successful “Home PC → Blob” raw ingestion (TeamGameLog)
 
 ### Where we left off (pipeline architecture)
