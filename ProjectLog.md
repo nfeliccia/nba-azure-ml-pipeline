@@ -1,4 +1,72 @@
 ﻿
+## 2025-12-18 — Step 2 completed: Python DB access (SQLAlchemy + pyodbc + Entra tokens) validated on VM
+
+### Goal
+
+Implement and validate Python database connectivity from `vm-nba-runner` to the private, serverless Azure SQL Database using **Microsoft Entra ID token auth**, so the VM loader can upsert without storing DB passwords.
+
+### What we did (since the last project log update)
+
+1. **Tightened DB permissions**
+
+* Confirmed `vm-nba-runner` only needs to read/write for upserts.
+* Removed unnecessary `db_ddladmin` from the VM managed identity (principle of least privilege).
+
+2. **Implemented DB connectivity using Codex**
+
+* Used Codex to generate a new DB module under `src/nba_pipeline/db/`:
+
+  * SQLAlchemy engine creation for Azure SQL
+  * Entra token injection into pyodbc connections
+  * Warmup helper with retries for serverless resume behavior
+  * Added/extended `smoke_test.py` with a `--db` mode to validate connectivity.
+
+3. **Adopted `uv` on the VM**
+
+* Standardized on `uv sync` + `uv run` instead of pip/venv commands to keep dependency management consistent and fast on Ubuntu.
+
+4. **Fixed two integration bugs discovered during VM testing**
+
+* **Bug 1:** `ImportError: TokenCredential`
+
+  * Root cause: `TokenCredential` is from `azure.core.credentials`, not `azure.identity`.
+  * Fix: import `TokenCredential` from the correct package (or remove the type annotation).
+* **Bug 2:** ODBC error `Invalid value specified for connection string attribute 'Authentication'`
+
+  * Root cause: when injecting Entra tokens via `attrs_before`, the ODBC connection string must not include conflicting attributes (commonly `Authentication=...` or SQLAlchemy-injected `Trusted_Connection=Yes`).
+  * Fix: updated `engine.py` to sanitize the final ODBC connection string in the SQLAlchemy `do_connect` hook by stripping `Trusted_Connection` and `Authentication`, then injecting the access token.
+
+5. **Validated end-to-end success on the VM**
+
+* Ran:
+
+  * `uv sync`
+  * `uv run python -m nba_pipeline.smoke_test --db`
+* Result:
+
+  * Successfully connected to private Azure SQL and printed `DB_NAME()=nba`
+  * DB smoke test passed.
+
+### Why this matters
+
+* We now have a working, repeatable, secretless pattern for the loader:
+
+  * VM uses **Managed Identity** (Entra token) to connect to Azure SQL privately.
+* This is a major prerequisite for the event-driven pipeline:
+
+  * Event Grid → Logic App → start VM → run loader → upsert into Azure SQL → shutdown logic.
+* The smoke test gives us a fast “green/red” signal for future debugging (network/DNS/identity/ODBC issues).
+
+### Current status
+
+* **Step 2 is complete**: DB access in Python is implemented and verified from `vm-nba-runner`.
+* Ready to move on to:
+
+  * loader implementation (download blob → parse JSON → stage → MERGE upsert),
+  * and then orchestration (Logic App + Run Command + idle shutdown watchdog).
+
+
+
 ## 2025-12-18 — Private Azure SQL bootstrap via Bastion + Entra tokens (sqlcmd)
 
 ### Context / Goal
@@ -232,7 +300,8 @@ Codex-generated (and then lightly corrected) a new extractor/uploader workflow:
 - CLI entrypoint:
   ```bash
   python -m nba_pipeline.ingest.run_extract --config config/extract.yaml
-````
+  ```
+  
 
 * Config supports:
 
