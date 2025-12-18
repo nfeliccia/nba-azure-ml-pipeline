@@ -17,7 +17,9 @@ dependencies = [
     "pyodbc",
     "sqlalchemy",
     "python-dotenv",
-    "azure-identity"
+    "azure-identity",
+    "azure-storage-blob",
+    "pyyaml"
 ]
 
 [project.optional-dependencies]
