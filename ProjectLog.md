@@ -1,4 +1,97 @@
-﻿## 2025-12-15 (Late Evening) — Option B completed end-to-end; NBA API blocked from Azure VM; plan hybrid ingest tomorrow
+﻿I checked `ProjectLog.md` and it **does not yet include yesterday’s work** (it currently ends at **2025-12-15**). 
+
+Here’s a ready-to-paste Markdown entry to append to the bottom of the log.
+
+---
+
+## 2025-12-17 — Entra Service Principal + Blob “Landing Zone” deployed with Bicep; ready for AzCopy test + home-PC runner
+
+**Objective**
+
+* Begin the “hybrid ingest” path (home PC fetches NBA data via residential ISP; Azure stays private for SQL).
+* Create an enterprise-friendly identity for uploads (**service principal**) and a raw data landing area in Azure (**Blob container**).
+* Use IaC (**Bicep**) + scripting (**PowerShell + Azure CLI**) for reproducibility.
+
+---
+
+### 1) Created Microsoft Entra ID Service Principal for uploader (PowerShell + Azure CLI)
+
+* Wrote and ran `scripts/powershell/create_tennant.ps1` to create a service principal with no RBAC assignment (`--skip-assignment`) and to persist credentials locally in `.env` (gitignored).
+* Generated `.env` (dev-style, not committed):
+
+  * `AZURE_SUBSCRIPTION_ID=659bc9fe-df16-4de2-902f-cf9883772bc7`
+  * `AZURE_TENANT_ID=cce0306d-cc27-4c78-80a1-00e10ecc1da3`
+  * `AZURE_CLIENT_ID=b2fc7d7c-fc7a-4bfe-90d2-2c993d216efc`
+  * `AZURE_SP_OBJECT_ID=5467314e-a9b9-47b5-9cf5-5232cec21ac9`
+  * `AZURE_CLIENT_SECRET=<stored locally; not committed>`
+* Key learning reinforced: **Tenant ID** represents the Entra directory (identity plane) and can span multiple subscriptions; subscription is the resource/billing boundary.
+
+---
+
+### 2) Deployed raw “landing zone” storage with Bicep (Storage Account + container + RBAC)
+
+* Confirmed Bicep file location: `infra\bicep\landingzone.bicep` (script initially failed because it referenced `infra\landingzone.bicep`).
+* Ran `scripts/powershell/deploy_landing_zone.ps1` successfully after fixing the file path.
+* Deployment details:
+
+  * Resource group: `rg-nba-landing`
+  * Location: `eastus`
+  * Storage account (generated): `stnba86412597`
+  * Container: `nba-raw`
+  * RBAC: granted the service principal **Storage Blob Data Contributor** at **container scope** (least privilege for uploads).
+
+**Deployment outputs (from `az deployment group create`)**
+
+* `storageAccount = stnba86412597`
+* `container = nba-raw`
+
+---
+
+### 3) Repo hygiene / interview-friendly practices
+
+* `.env` is gitignored (dev-style secret handling).
+* Planned workflow: clone repo onto Windows 11 home PC for extractor runtime, but *AzCopy test upload can be done without full repo* (only needs AzCopy + SP creds + destination URL).
+* Prepared commit message:
+
+  * `Add Entra service principal bootstrap + Bicep landing zone deploy scripts (.env gitignored)`
+
+---
+
+## Current state (end of day)
+
+* Service principal exists and is ready to authenticate uploads.
+* Blob landing zone exists and RBAC is configured.
+* Next step is to prove end-to-end upload with **AzCopy login via service principal** and a test file from the home PC.
+
+---
+
+## Next steps (start here tomorrow / next session)
+
+1. On home PC:
+
+   * Install/verify `azcopy`
+   * `azcopy login --service-principal` using:
+
+     * `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZCOPY_SPA_CLIENT_SECRET` (mapped from `AZURE_CLIENT_SECRET`)
+2. Upload test file to confirm RBAC:
+
+   * `https://stnba86412597.blob.core.windows.net/nba-raw/test_upload.txt`
+3. Once AzCopy works:
+
+   * Clone repo to home PC
+   * Run NBA API extraction locally
+   * Upload raw + normalized artifacts to `nba-raw/`
+4. On Azure private VM:
+
+   * Download from blob
+   * Load into private Azure SQL via Managed Identity (keeping SQL private-only)
+
+---
+
+If you paste this into `ProjectLog.md`, we’ll pick up exactly where we left off: **AzCopy SP login + test upload on the home PC**, then clone the repo and run the first “home fetch → blob upload” cycle.
+
+
+## 2025-12-15 (Late Evening) — Option B completed end-to-end; NBA API blocked from Azure VM; plan hybrid ingest tomorrow
 
 **Objective**
 - Complete the “showcase-grade” Option B architecture:
