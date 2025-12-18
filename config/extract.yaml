@@ -1,0 +1,20 @@
+# config/extract.yaml
+endpoint: "teamgamelog"
+
+# For testing: one team + one season
+teams:
+  - 1610612744   # Warriors
+seasons:
+  - "2023-24"
+
+output:
+  # blob prefix inside container nba-raw
+  blob_prefix: "runs"
+
+  # filename strategy: one JSON per team per season per run_id
+  # (run_id is generated at runtime)
+  filename_template: "teamgamelog_team{team_id}_season{season}_{run_id}.json"
+
+azure:
+  storage_account: "stnba86412597"
+  container: "nba-raw"

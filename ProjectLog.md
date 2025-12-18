@@ -1,8 +1,105 @@
-﻿I checked `ProjectLog.md` and it **does not yet include yesterday’s work** (it currently ends at **2025-12-15**). 
+﻿## 2025-12-17 — ## Architecture decision: “Home PC egress” for NBA API + “Azure private data plane” for SQL load
 
-Here’s a ready-to-paste Markdown entry to append to the bottom of the log.
+### Root constraint (why this architecture exists)
+The NBA API blocks requests originating from Microsoft Azure–associated public IP ranges. This means any design where an Azure VM, Azure Function, or other Azure-hosted compute calls the NBA API directly is unreliable (or will fail outright).
 
----
+Therefore, we must ensure **no Azure-hosted component ever calls the NBA API**.
+
+### Primary design goal
+Keep the pipeline **simple and low-debt**:
+
+- Minimal bespoke automation on the home machine.
+- Avoid unnecessary intermediate artifact formats (CSV/Parquet “silver” landing zone) unless we later have a clear need.
+- Prefer an “in-memory” flow: JSON → DataFrame → direct DB upsert.
+- Preserve an auditable handoff between “public internet” and “private Azure” without building a complicated data lake.
+
+### Decision: Split the pipeline into two tiers
+We adopt a two-tier architecture:
+
+#### Tier A — Extraction (Home PC: public internet egress)
+**Responsibility:** Call NBA API endpoints and produce raw payloads.
+
+- Runs on the home PC specifically because its residential ISP egress is not blocked.
+- Output is **raw JSON only** (the authoritative source for what was fetched).
+- The home PC then uploads raw JSON to Azure Blob storage.
+
+Key point: the home PC is used only as a **network egress workaround**, not as a long-running compute environment.
+
+#### Tier B — Load/Transform (Azure Private VM: private data plane)
+**Responsibility:** Convert raw JSON to a DataFrame and load into **private Azure SQL**.
+
+- Azure VM never calls the NBA API.
+- Azure VM downloads raw JSON from Blob using Azure identity-based access.
+- Azure VM performs JSON → DataFrame transformation and then **upserts directly into Azure SQL**.
+
+Authentication and access:
+- Azure VM uses **Managed Identity** for least-privilege access to:
+  - Read from Blob (Storage Blob Data Reader)
+  - Write to Azure SQL (AAD-based auth)
+
+### Data movement (single handoff point)
+Azure Blob Storage is used as the **handoff boundary** between:
+- Public internet acquisition (home machine)
+- Private/secure processing and persistence (Azure VM + Azure SQL)
+
+Blob is not being used as a “data lakehouse” here; it’s simply a reliable transfer point and audit trail.
+
+### Loading strategy: stage + MERGE (idempotent upsert)
+On the Azure VM, we load to SQL using a stable, rerunnable pattern:
+
+1. Create/maintain target tables in `dbo` (e.g., `dbo.fact_team_game_log`) with a natural key / primary key.
+2. Load DataFrame rows into a staging table (e.g., `stg.fact_team_game_log`).
+3. Run a SQL `MERGE` from staging → target keyed on `(team_id, game_id)` (or other stable natural key).
+4. Truncate staging after a successful merge.
+
+This approach:
+- Is idempotent (safe to rerun).
+- Avoids duplicates.
+- Allows incremental loads.
+- Keeps the pipeline simple without needing Parquet/CSV layers.
+
+### Folder conventions: keep it minimal, raw-only by default
+We will keep a simple run folder convention in Blob primarily for traceability:
+
+- `nba-raw/runs/<run_id>/raw/...`  (raw JSONs)
+- `nba-raw/runs/LATEST.txt`        (pointer to latest run_id)
+
+We are **not** committing to producing Parquet/CSV outputs at this stage.
+
+### Manifest: optional, and lightweight if used
+A manifest is not required for the first working pipeline.
+If/when we add it, it should remain lightweight and focused on operational traceability:
+
+- run_id, created_at_utc
+- list of raw JSON artifacts (paths, sizes, sha256)
+- basic derived stats (optional): row counts after parse, min/max dates, etc.
+
+### Why we are avoiding Parquet/CSV landing zones (for now)
+Parquet/CSV “silver” artifacts add additional complexity:
+- More code paths (write, read, schema management)
+- More failure modes (file formats, partitioning, serialization issues)
+- More conventions to maintain
+
+Given the current goal—get reliable ingestion + loading working under the Azure IP block—raw JSON + direct upsert is the most minimal, robust approach.
+
+### Future-proofing (not coding into a corner)
+This architecture intentionally keeps “optional improvements” available without forcing them now:
+
+- If the NBA API block is removed/solved later:
+  - We can move Tier A into Azure compute and eliminate the home PC step.
+- If we later need better reproducibility, backfills, or analytics in Blob:
+  - We can add curated/normalized Parquet outputs then.
+- If we later orchestrate:
+  - The handoff design supports adding scheduling/automation (Task Scheduler at home; cron on VM; or Event Grid + Function for notifications) without changing the core pattern.
+
+### Summary
+We are deliberately choosing a low-debt design:
+- Home PC does **only** the NBA API calls + raw JSON upload.
+- Azure VM does JSON → DataFrame → **direct** SQL upsert using Managed Identity.
+- Blob is the minimal boundary between public egress and private processing.
+- Parquet/CSV layers are postponed until there is a clear requirement.
+
+
 
 ## 2025-12-17 — Entra Service Principal + Blob “Landing Zone” deployed with Bicep; ready for AzCopy test + home-PC runner
 
