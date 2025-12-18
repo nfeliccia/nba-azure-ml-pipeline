@@ -1,4 +1,379 @@
-﻿## 2025-12-15 (Late Evening) — Option B completed end-to-end; NBA API blocked from Azure VM; plan hybrid ingest tomorrow
+﻿
+````markdown
+## 2025-12-18 — First successful “Home PC → Blob” raw ingestion (TeamGameLog)
+
+### Where we left off (pipeline architecture)
+We are intentionally using a two-tier design due to the NBA API blocking Microsoft Azure–associated IP ranges:
+
+- **Home PC (public internet egress):** call NBA API and upload **raw JSON** to Azure Blob.
+- **Azure cloud side (private VM + Azure SQL):** download raw JSON and upsert into private Azure SQL using identity-based access.
+- Azure-hosted compute will **not** call the NBA API directly.
+
+Blob storage acts as the clean handoff boundary between public egress and the private Azure data plane.
+
+---
+
+### What was implemented
+Codex-generated (and then lightly corrected) a new extractor/uploader workflow:
+
+1) **Config-driven CLI**
+- Config file: `config/extract.yaml`
+- CLI entrypoint:
+  ```bash
+  python -m nba_pipeline.ingest.run_extract --config config/extract.yaml
+````
+
+* Config supports:
+
+  * `teams` as a list
+  * `seasons` as a list
+  * output prefix and filename template
+
+2. **SP-based Blob upload (no AzCopy, no PowerShell uploads)**
+
+* `.env` in repo root contains:
+
+  * `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`
+  * `AZURE_STORAGE_ACCOUNT=stnba86412597`
+  * `AZURE_STORAGE_CONTAINER=nba-raw`
+* Uploads use `azure-identity` + `azure-storage-blob` via a reusable `BlobUploader` helper.
+* We explicitly avoided requiring `AZURE_STORAGE_CONNECTION_STRING` to keep the auth model consistent and sustainable.
+
+3. **Run-scoped blob naming convention**
+   Each run generates a UTC `run_id` and uploads to:
+
+`runs/<run_id>/raw/nba_api/teamgamelog/<filename>.json`
+
+This gives:
+
+* clear lineage and auditability
+* straightforward reprocessing by run_id
+* easy filtering for event triggers
+
+---
+
+### Issue encountered and resolution (RBAC + resource move)
+
+We hit a 403 error:
+
+`AuthorizationPermissionMismatch` during a container preflight operation.
+
+Root cause:
+
+* The storage account was moved to a new resource group (`rg_nba_prediction_26`), and prior RBAC assignments did not exist at the new scope.
+
+Fix:
+
+* Granted the service principal the **Storage Blob Data Contributor** role at the storage account scope in the new RG.
+
+---
+
+### Successful test run (proof)
+
+Ran:
+
+```powershell
+uv run python -m nba_pipeline.ingest.run_extract --config ./config/extract.yaml
+```
+
+Output:
+
+* run_id generated: `20251218T170334Z`
+* 1 team × 1 season
+* Upload succeeded:
+
+  * blob path:
+    `runs/20251218T170334Z/raw/nba_api/teamgamelog/teamgamelog_team1610612744_season2023-24_20251218T170334Z.json`
+  * size ~13.35 KiB
+* Verified in Azure Portal by browsing the container and downloading the blob; JSON content looks correct.
+
+Note:
+
+* The depth of the blob prefix is not a technical concern; Blob “folders” are just prefixes on a single blob name string. This structure is compatible with Event Grid filtering and/or blob trigger logic for Azure Functions.
+
+---
+
+### Next planned step (new chapter)
+
+Implement an **Azure Function** (or equivalent Azure-hosted compute) that:
+
+1. triggers when a new blob is created under the TeamGameLog prefix
+2. reads the raw JSON
+3. parses into a DataFrame (or direct row objects)
+4. performs an idempotent SQL upsert (stage + MERGE) into Azure SQL
+
+We are at a good stopping point: ingestion-to-Blob is now working end-to-end.
+
+```
+```
+
+## 2025-12-18 — Local Extract → Blob Handoff (Run Extract CLI + Config)
+
+### Context / Why we changed the approach
+We confirmed the root constraint: the NBA API blocks requests originating from Microsoft Azure–associated public IP ranges. Because of this, any design where Azure-hosted compute calls the NBA API directly is unreliable.
+
+Therefore, we intentionally split the pipeline into two tiers:
+- **Home PC (public internet egress):** call NBA API and upload **raw JSON** to Azure Blob.
+- **Azure private VM (private data plane):** later downloads raw JSON from Blob and loads into private Azure SQL (via Managed Identity).
+
+This avoids coding ourselves into a corner and keeps the cloud-side clean: Azure never calls the NBA API.
+
+---
+
+### What we built today (repo changes)
+We implemented a production-oriented **run_extract** CLI that performs the minimal responsibilities needed on the home machine:
+
+1) **Reads configuration from YAML**
+- New file: `config/extract.yaml`
+- Supports:
+  - `teams` (list)
+  - `seasons` (list, e.g. `["2023-24"]` for testing)
+  - `output.blob_prefix` (e.g. `runs`)
+  - a filename template for deterministic per-team/per-season JSON outputs
+
+2) **Loads credentials from `.env`**
+- `.env` is local and gitignored.
+- Added convenience variables:
+  - `AZURE_STORAGE_ACCOUNT=stnba86412597`
+  - `AZURE_STORAGE_CONTAINER=nba-raw`
+- Existing Service Principal values remain the core auth mechanism:
+  - `AZURE_TENANT_ID`
+  - `AZURE_CLIENT_ID`
+  - `AZURE_CLIENT_SECRET`
+  - (subscription/object id are present but not required for Blob upload)
+
+3) **Fetches NBA TeamGameLog with retries + validation**
+- New module: `src/nba_pipeline/ingest/run_extract.py`
+- Behavior:
+  - Generates a UTC `run_id` in the format `YYYYMMDDTHHMMSSZ`
+  - Loops through configured `teams × seasons`
+  - Calls `nba_api.stats.endpoints.teamgamelog.TeamGameLog(team_id=..., season=...)`
+  - Retries transient failures using exponential backoff
+  - Validates the response payload is shaped as expected (resultSets + headers/rowSet)
+
+4) **Uploads raw JSON directly to Azure Blob (no parquet/csv, no “silver” layer yet)**
+- New helper: `src/nba_pipeline/ops/blob_uploader.py`
+- Upload behavior:
+  - Auth supports either:
+    - connection string (if present), OR
+    - service principal via `ClientSecretCredential`
+  - Uploads content as JSON with appropriate content settings
+  - Uploads one JSON blob per `(team_id, season)` for the run
+- Blob path convention is run-scoped and organized:
+  - `runs/<run_id>/raw/nba_api/teamgamelog/<filename>`
+- Logs one line per upload including:
+  - team_id
+  - season
+  - blob path
+  - bytes uploaded
+
+5) **Dependencies**
+- Added dependencies to support:
+  - YAML parsing
+  - Azure Blob client + AAD credential auth
+  - dotenv loading
+- Note: `uv lock` failed during Codex attempt due to a tunnel/network issue reaching PyPI; lockfile remained unchanged. This is an environment/network limitation, not a code limitation.
+
+---
+
+### How to run it (home PC)
+From repo root:
+
+```bash
+python -m nba_pipeline.ingest.run_extract --config config/extract.yaml
+```
+
+## 2025-12-17 — ## Architecture decision: “Home PC egress” for NBA API + “Azure private data plane” for SQL load
+
+### Root constraint (why this architecture exists)
+The NBA API blocks requests originating from Microsoft Azure–associated public IP ranges. This means any design where an Azure VM, Azure Function, or other Azure-hosted compute calls the NBA API directly is unreliable (or will fail outright).
+
+Therefore, we must ensure **no Azure-hosted component ever calls the NBA API**.
+
+### Primary design goal
+Keep the pipeline **simple and low-debt**:
+
+- Minimal bespoke automation on the home machine.
+- Avoid unnecessary intermediate artifact formats (CSV/Parquet “silver” landing zone) unless we later have a clear need.
+- Prefer an “in-memory” flow: JSON → DataFrame → direct DB upsert.
+- Preserve an auditable handoff between “public internet” and “private Azure” without building a complicated data lake.
+
+### Decision: Split the pipeline into two tiers
+We adopt a two-tier architecture:
+
+#### Tier A — Extraction (Home PC: public internet egress)
+**Responsibility:** Call NBA API endpoints and produce raw payloads.
+
+- Runs on the home PC specifically because its residential ISP egress is not blocked.
+- Output is **raw JSON only** (the authoritative source for what was fetched).
+- The home PC then uploads raw JSON to Azure Blob storage.
+
+Key point: the home PC is used only as a **network egress workaround**, not as a long-running compute environment.
+
+#### Tier B — Load/Transform (Azure Private VM: private data plane)
+**Responsibility:** Convert raw JSON to a DataFrame and load into **private Azure SQL**.
+
+- Azure VM never calls the NBA API.
+- Azure VM downloads raw JSON from Blob using Azure identity-based access.
+- Azure VM performs JSON → DataFrame transformation and then **upserts directly into Azure SQL**.
+
+Authentication and access:
+- Azure VM uses **Managed Identity** for least-privilege access to:
+  - Read from Blob (Storage Blob Data Reader)
+  - Write to Azure SQL (AAD-based auth)
+
+### Data movement (single handoff point)
+Azure Blob Storage is used as the **handoff boundary** between:
+- Public internet acquisition (home machine)
+- Private/secure processing and persistence (Azure VM + Azure SQL)
+
+Blob is not being used as a “data lakehouse” here; it’s simply a reliable transfer point and audit trail.
+
+### Loading strategy: stage + MERGE (idempotent upsert)
+On the Azure VM, we load to SQL using a stable, rerunnable pattern:
+
+1. Create/maintain target tables in `dbo` (e.g., `dbo.fact_team_game_log`) with a natural key / primary key.
+2. Load DataFrame rows into a staging table (e.g., `stg.fact_team_game_log`).
+3. Run a SQL `MERGE` from staging → target keyed on `(team_id, game_id)` (or other stable natural key).
+4. Truncate staging after a successful merge.
+
+This approach:
+- Is idempotent (safe to rerun).
+- Avoids duplicates.
+- Allows incremental loads.
+- Keeps the pipeline simple without needing Parquet/CSV layers.
+
+### Folder conventions: keep it minimal, raw-only by default
+We will keep a simple run folder convention in Blob primarily for traceability:
+
+- `nba-raw/runs/<run_id>/raw/...`  (raw JSONs)
+- `nba-raw/runs/LATEST.txt`        (pointer to latest run_id)
+
+We are **not** committing to producing Parquet/CSV outputs at this stage.
+
+### Manifest: optional, and lightweight if used
+A manifest is not required for the first working pipeline.
+If/when we add it, it should remain lightweight and focused on operational traceability:
+
+- run_id, created_at_utc
+- list of raw JSON artifacts (paths, sizes, sha256)
+- basic derived stats (optional): row counts after parse, min/max dates, etc.
+
+### Why we are avoiding Parquet/CSV landing zones (for now)
+Parquet/CSV “silver” artifacts add additional complexity:
+- More code paths (write, read, schema management)
+- More failure modes (file formats, partitioning, serialization issues)
+- More conventions to maintain
+
+Given the current goal—get reliable ingestion + loading working under the Azure IP block—raw JSON + direct upsert is the most minimal, robust approach.
+
+### Future-proofing (not coding into a corner)
+This architecture intentionally keeps “optional improvements” available without forcing them now:
+
+- If the NBA API block is removed/solved later:
+  - We can move Tier A into Azure compute and eliminate the home PC step.
+- If we later need better reproducibility, backfills, or analytics in Blob:
+  - We can add curated/normalized Parquet outputs then.
+- If we later orchestrate:
+  - The handoff design supports adding scheduling/automation (Task Scheduler at home; cron on VM; or Event Grid + Function for notifications) without changing the core pattern.
+
+### Summary
+We are deliberately choosing a low-debt design:
+- Home PC does **only** the NBA API calls + raw JSON upload.
+- Azure VM does JSON → DataFrame → **direct** SQL upsert using Managed Identity.
+- Blob is the minimal boundary between public egress and private processing.
+- Parquet/CSV layers are postponed until there is a clear requirement.
+
+
+
+## 2025-12-17 — Entra Service Principal + Blob “Landing Zone” deployed with Bicep; ready for AzCopy test + home-PC runner
+
+**Objective**
+
+* Begin the “hybrid ingest” path (home PC fetches NBA data via residential ISP; Azure stays private for SQL).
+* Create an enterprise-friendly identity for uploads (**service principal**) and a raw data landing area in Azure (**Blob container**).
+* Use IaC (**Bicep**) + scripting (**PowerShell + Azure CLI**) for reproducibility.
+
+---
+
+### 1) Created Microsoft Entra ID Service Principal for uploader (PowerShell + Azure CLI)
+
+* Wrote and ran `scripts/powershell/create_tennant.ps1` to create a service principal with no RBAC assignment (`--skip-assignment`) and to persist credentials locally in `.env` (gitignored).
+* Generated `.env` (dev-style, not committed):
+
+  * `AZURE_SUBSCRIPTION_ID=659bc9fe-df16-4de2-902f-cf9883772bc7`
+  * `AZURE_TENANT_ID=cce0306d-cc27-4c78-80a1-00e10ecc1da3`
+  * `AZURE_CLIENT_ID=b2fc7d7c-fc7a-4bfe-90d2-2c993d216efc`
+  * `AZURE_SP_OBJECT_ID=5467314e-a9b9-47b5-9cf5-5232cec21ac9`
+  * `AZURE_CLIENT_SECRET=<stored locally; not committed>`
+* Key learning reinforced: **Tenant ID** represents the Entra directory (identity plane) and can span multiple subscriptions; subscription is the resource/billing boundary.
+
+---
+
+### 2) Deployed raw “landing zone” storage with Bicep (Storage Account + container + RBAC)
+
+* Confirmed Bicep file location: `infra\bicep\landingzone.bicep` (script initially failed because it referenced `infra\landingzone.bicep`).
+* Ran `scripts/powershell/deploy_landing_zone.ps1` successfully after fixing the file path.
+* Deployment details:
+
+  * Resource group: `rg-nba-landing`
+  * Location: `eastus`
+  * Storage account (generated): `stnba86412597`
+  * Container: `nba-raw`
+  * RBAC: granted the service principal **Storage Blob Data Contributor** at **container scope** (least privilege for uploads).
+
+**Deployment outputs (from `az deployment group create`)**
+
+* `storageAccount = stnba86412597`
+* `container = nba-raw`
+
+---
+
+### 3) Repo hygiene / interview-friendly practices
+
+* `.env` is gitignored (dev-style secret handling).
+* Planned workflow: clone repo onto Windows 11 home PC for extractor runtime, but *AzCopy test upload can be done without full repo* (only needs AzCopy + SP creds + destination URL).
+* Prepared commit message:
+
+  * `Add Entra service principal bootstrap + Bicep landing zone deploy scripts (.env gitignored)`
+
+---
+
+## Current state (end of day)
+
+* Service principal exists and is ready to authenticate uploads.
+* Blob landing zone exists and RBAC is configured.
+* Next step is to prove end-to-end upload with **AzCopy login via service principal** and a test file from the home PC.
+
+---
+
+## Next steps (start here tomorrow / next session)
+
+1. On home PC:
+
+   * Install/verify `azcopy`
+   * `azcopy login --service-principal` using:
+
+     * `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZCOPY_SPA_CLIENT_SECRET` (mapped from `AZURE_CLIENT_SECRET`)
+2. Upload test file to confirm RBAC:
+
+   * `https://stnba86412597.blob.core.windows.net/nba-raw/test_upload.txt`
+3. Once AzCopy works:
+
+   * Clone repo to home PC
+   * Run NBA API extraction locally
+   * Upload raw + normalized artifacts to `nba-raw/`
+4. On Azure private VM:
+
+   * Download from blob
+   * Load into private Azure SQL via Managed Identity (keeping SQL private-only)
+
+---
+
+If you paste this into `ProjectLog.md`, we’ll pick up exactly where we left off: **AzCopy SP login + test upload on the home PC**, then clone the repo and run the first “home fetch → blob upload” cycle.
+
+
+## 2025-12-15 (Late Evening) — Option B completed end-to-end; NBA API blocked from Azure VM; plan hybrid ingest tomorrow
 
 **Objective**
 - Complete the “showcase-grade” Option B architecture:
