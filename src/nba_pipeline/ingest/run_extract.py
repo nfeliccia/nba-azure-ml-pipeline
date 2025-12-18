@@ -107,14 +107,19 @@ def main(argv: list[str] | None = None) -> int:
 
     account_name, container_name = resolve_storage_settings(config)
     run_id = generate_run_id()
+    ati = os.getenv("AZURE_TENANT_ID")
+    aci = os.getenv("AZURE_CLIENT_ID")
+    acs = os.getenv("AZURE_CLIENT_SECRET")
+    if not (ati and aci and acs):
+        raise ValueError("Missing SP creds: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET are required.")
 
     uploader = BlobUploader(
         account_name=account_name,
         container_name=container_name,
-        connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
-        tenant_id=os.getenv("AZURE_TENANT_ID"),
-        client_id=os.getenv("AZURE_CLIENT_ID"),
-        client_secret=os.getenv("AZURE_CLIENT_SECRET"),
+        connection_string=None,
+        tenant_id=ati,
+        client_id=aci,
+        client_secret=acs,
     )
 
     print(f"Starting run_id={run_id} for {len(teams)} teams x {len(seasons)} seasons")

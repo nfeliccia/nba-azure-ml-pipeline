@@ -1,4 +1,80 @@
-﻿## 2025-12-17 — ## Architecture decision: “Home PC egress” for NBA API + “Azure private data plane” for SQL load
+﻿## 2025-12-18 — Local Extract → Blob Handoff (Run Extract CLI + Config)
+
+### Context / Why we changed the approach
+We confirmed the root constraint: the NBA API blocks requests originating from Microsoft Azure–associated public IP ranges. Because of this, any design where Azure-hosted compute calls the NBA API directly is unreliable.
+
+Therefore, we intentionally split the pipeline into two tiers:
+- **Home PC (public internet egress):** call NBA API and upload **raw JSON** to Azure Blob.
+- **Azure private VM (private data plane):** later downloads raw JSON from Blob and loads into private Azure SQL (via Managed Identity).
+
+This avoids coding ourselves into a corner and keeps the cloud-side clean: Azure never calls the NBA API.
+
+---
+
+### What we built today (repo changes)
+We implemented a production-oriented **run_extract** CLI that performs the minimal responsibilities needed on the home machine:
+
+1) **Reads configuration from YAML**
+- New file: `config/extract.yaml`
+- Supports:
+  - `teams` (list)
+  - `seasons` (list, e.g. `["2023-24"]` for testing)
+  - `output.blob_prefix` (e.g. `runs`)
+  - a filename template for deterministic per-team/per-season JSON outputs
+
+2) **Loads credentials from `.env`**
+- `.env` is local and gitignored.
+- Added convenience variables:
+  - `AZURE_STORAGE_ACCOUNT=stnba86412597`
+  - `AZURE_STORAGE_CONTAINER=nba-raw`
+- Existing Service Principal values remain the core auth mechanism:
+  - `AZURE_TENANT_ID`
+  - `AZURE_CLIENT_ID`
+  - `AZURE_CLIENT_SECRET`
+  - (subscription/object id are present but not required for Blob upload)
+
+3) **Fetches NBA TeamGameLog with retries + validation**
+- New module: `src/nba_pipeline/ingest/run_extract.py`
+- Behavior:
+  - Generates a UTC `run_id` in the format `YYYYMMDDTHHMMSSZ`
+  - Loops through configured `teams × seasons`
+  - Calls `nba_api.stats.endpoints.teamgamelog.TeamGameLog(team_id=..., season=...)`
+  - Retries transient failures using exponential backoff
+  - Validates the response payload is shaped as expected (resultSets + headers/rowSet)
+
+4) **Uploads raw JSON directly to Azure Blob (no parquet/csv, no “silver” layer yet)**
+- New helper: `src/nba_pipeline/ops/blob_uploader.py`
+- Upload behavior:
+  - Auth supports either:
+    - connection string (if present), OR
+    - service principal via `ClientSecretCredential`
+  - Uploads content as JSON with appropriate content settings
+  - Uploads one JSON blob per `(team_id, season)` for the run
+- Blob path convention is run-scoped and organized:
+  - `runs/<run_id>/raw/nba_api/teamgamelog/<filename>`
+- Logs one line per upload including:
+  - team_id
+  - season
+  - blob path
+  - bytes uploaded
+
+5) **Dependencies**
+- Added dependencies to support:
+  - YAML parsing
+  - Azure Blob client + AAD credential auth
+  - dotenv loading
+- Note: `uv lock` failed during Codex attempt due to a tunnel/network issue reaching PyPI; lockfile remained unchanged. This is an environment/network limitation, not a code limitation.
+
+---
+
+### How to run it (home PC)
+From repo root:
+
+```bash
+python -m nba_pipeline.ingest.run_extract --config config/extract.yaml
+```
+
+## 2025-12-17 — ## Architecture decision: “Home PC egress” for NBA API + “Azure private data plane” for SQL load
 
 ### Root constraint (why this architecture exists)
 The NBA API blocks requests originating from Microsoft Azure–associated public IP ranges. This means any design where an Azure VM, Azure Function, or other Azure-hosted compute calls the NBA API directly is unreliable (or will fail outright).
