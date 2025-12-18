@@ -34,7 +34,7 @@ function Import-DotEnvFile
 }
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
-$envPath = Join-Path $repoRoot "nba-azure-ml-pipeline.env"
+$envPath = Join-Path $repoRoot ".env"
 
 Import-DotEnvFile -Path $envPath
 # Validate required vars
